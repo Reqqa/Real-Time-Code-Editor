@@ -15,3 +15,15 @@ pub struct BroadcastPayload {
     pub sender_id: u64,
     pub text: String,
 }
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ServerMessage {
+    // Sent once when a client joins — loads the existing document
+    Snapshot { content: String },
+    // Broadcast to all others when someone edits
+    Edit     { user: String, content: String, cursor: usize },
+    // Broadcast when someone joins/leaves (for user list)
+    Joined   { user: String },
+    Left     { user: String },
+}

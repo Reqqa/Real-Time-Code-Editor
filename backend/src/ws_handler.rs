@@ -1,18 +1,9 @@
-use axum::{
-    extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
-        State,
-    },
-    response::IntoResponse,
-};
-use futures_util::{sink::SinkExt, stream::StreamExt};
-use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::{broadcast, mpsc};
-
-use crate::messages::{BroadcastPayload, ClientMessage};
-use crate::room::{get_or_create_room, RoomMap};
-
-static NEXT_USER_ID: AtomicU64 = AtomicU64::new(1);
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::State;
+use axum::response::IntoResponse;
+use futures::{SinkExt, StreamExt};
+use crate::messages::{ClientMessage, ServerMessage, BroadcastPayload};
+use crate::room::RoomMap;
 
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
@@ -21,70 +12,121 @@ pub async fn ws_handler(
     ws.on_upgrade(|socket| handle_socket(socket, rooms))
 }
 
-async fn handle_socket(socket: WebSocket, rooms: RoomMap) {
-    let client_id = NEXT_USER_ID.fetch_add(1, Ordering::Relaxed);
-    let (mut ws_sender, mut receiver) = socket.split();
+async fn handle_socket(socket: WebSocket, state: RoomMap) {
+    let (mut ws_send, mut ws_recv) = socket.split();
 
-    // ── Fix: use an mpsc channel so ws_sender is owned by ONE task forever.
-    //    Previously, ws_sender was moved into tokio::spawn on the first Join,
-    //    making it impossible to handle a second Join or any reconnect.
-    let (out_tx, mut out_rx) = mpsc::channel::<String>(32);
+    // ── Step 1: wait for Join message ─────────────────────────────────────
+    let (room_id, username) = loop {
+        match ws_recv.next().await {
+            Some(Ok(Message::Text(text))) => {
+                println!("Raw string received on startup: {}", text);
+                match serde_json::from_str::<ClientMessage>(&text) {
+                    Ok(ClientMessage::Join { user, room }) => {
+                        println!("Join successful! User '{}' joined room '{}'", user, room);
+                        break (room, user);
+                    }
+                    Err(e) => {
+                        println!("Serde failed to parse Join message: {:?}", e);
+                    }
+                    _ => continue,
+                }
+            }
+            _ => return,
+        }
+    };
 
-    // This task owns ws_sender exclusively — no move conflict on re-join
-    tokio::spawn(async move {
-        while let Some(text) = out_rx.recv().await {
-            if ws_sender.send(Message::Text(text)).await.is_err() {
+    let client_numeric_id = fxhash::hash64(&username);
+
+    // ── Step 2: get channel + snapshot, announce join ──────────────────────
+    let (tx, snapshot) = {
+        let mut s = state.lock().await;
+        let tx       = s.get_or_create_channel(&room_id);
+        let snapshot = s.get_document(&room_id);
+        (tx, snapshot)
+    };
+
+    // Send snapshot privately to the newly joined client
+    let snap_inner = serde_json::to_string(&ServerMessage::Snapshot {
+        content: snapshot,
+    }).unwrap();
+    let snap_msg = serde_json::to_string(&BroadcastPayload {
+        sender_id: 0, // 0 = system/server
+        text: snap_inner,
+    }).unwrap();
+    if ws_send.send(Message::Text(snap_msg)).await.is_err() {
+        return;
+    }
+
+    // Announce to the room that someone joined
+    let joined_msg = serde_json::to_string(&ServerMessage::Joined {
+        user: username.clone(),
+    }).unwrap();
+    let _ = tx.send(BroadcastPayload {
+        sender_id: client_numeric_id,
+        text: joined_msg,
+    });
+
+    let mut rx = tx.subscribe();
+
+    // ── Step 3: outbound task — broadcast channel → this client ───────────
+    // FIX: was incorrectly reading ws_recv here instead of forwarding from rx
+    let mut send_task = tokio::spawn(async move {
+        while let Ok(payload) = rx.recv().await {
+            println!("Forwarding broadcast to client: {}", payload.text);
+            if ws_send.send(Message::Text(payload.text)).await.is_err() {
                 break;
             }
         }
     });
 
-    let mut tx: Option<broadcast::Sender<BroadcastPayload>> = None;
-    let mut rx_task: Option<tokio::task::JoinHandle<()>> = None;
+    // ── Step 4: inbound task — this client → save + broadcast ─────────────
+    // FIX: recv_task and select! were nested inside send_task's closure; moved out
+    let state_clone = state.clone();
+    let room_clone  = room_id.clone();
+    let user_clone  = username.clone();
+    let tx_clone    = tx.clone();
 
-    while let Some(Ok(Message::Text(text))) = receiver.next().await {
-        if let Ok(msg) = serde_json::from_str::<ClientMessage>(&text) {
-            match msg {
-                ClientMessage::Join { room, .. } => {
-                    // Abort previous broadcast listener if switching rooms
-                    if let Some(task) = rx_task.take() {
-                        task.abort();
+    let mut recv_task = tokio::spawn(async move {
+        while let Some(Ok(Message::Text(text))) = ws_recv.next().await {
+            println!("✏️ Raw incoming string while typing: {}", text);
+            match serde_json::from_str::<ClientMessage>(&text) {
+                Ok(ClientMessage::Edit { content, cursor, .. }) => {
+                    println!(" Handling Edit from '{}'!", user_clone);
+                    {
+                        let mut s = state_clone.lock().await;
+                        s.save_document(&room_clone, content.clone());
                     }
-
-                    let channel_tx = get_or_create_room(&rooms, &room);
-                    let mut channel_rx = channel_tx.subscribe();
-                    tx = Some(channel_tx);
-
-                    // Clone out_tx so the spawn can forward to ws_sender task
-                    let out_tx_clone = out_tx.clone();
-
-                    rx_task = Some(tokio::spawn(async move {
-                        while let Ok(payload) = channel_rx.recv().await {
-                            if payload.sender_id != client_id {
-                                if out_tx_clone.send(payload.text).await.is_err() {
-                                    break;
-                                }
-                            }
-                        }
-                    }));
+                    let out = serde_json::to_string(&ServerMessage::Edit {
+                        user:    user_clone.clone(),
+                        content,
+                        cursor,
+                    }).unwrap();
+                    let _ = tx_clone.send(BroadcastPayload {
+                        sender_id: client_numeric_id,
+                        text: out,
+                    });
                 }
-
-                ClientMessage::Edit { .. }
-                | ClientMessage::Cursor { .. }
-                | ClientMessage::Leave { .. } => {
-                    if let Some(ref t) = tx {
-                        let payload = BroadcastPayload {
-                            sender_id: client_id,
-                            text: text.to_string(),
-                        };
-                        let _ = t.send(payload);
-                    }
+                Ok(ClientMessage::Leave { .. }) => break,
+                Err(e) => {
+                    println!("Serde failed to parse Edit message: {:?}", e);
                 }
+                _ => {}
             }
         }
-    }
 
-    if let Some(task) = rx_task {
-        task.abort();
+        // Client disconnected — announce to the room
+        let left_msg = serde_json::to_string(&ServerMessage::Left {
+            user: user_clone,
+        }).unwrap();
+        let _ = tx_clone.send(BroadcastPayload {
+            sender_id: client_numeric_id,
+            text: left_msg,
+        });
+    });
+
+    // ── Step 5: if either task ends, abort the other ───────────────────────
+    tokio::select! {
+        _ = &mut send_task => recv_task.abort(),
+        _ = &mut recv_task => send_task.abort(),
     }
 }

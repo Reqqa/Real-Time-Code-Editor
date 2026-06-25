@@ -5,13 +5,18 @@ mod ws_handler;
 use axum::{routing::get, Router};
 use room::RoomMap;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
 use ws_handler::ws_handler;
 
+use crate::room::AppState;
+
+
 #[tokio::main]
 async fn main() {
-    let rooms: RoomMap = Arc::new(Mutex::new(HashMap::new()));
+    let rooms: RoomMap = Arc::new(Mutex::new(AppState::new()));
+
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
