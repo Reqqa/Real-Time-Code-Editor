@@ -3,10 +3,22 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
-    Join   { user: String, room: String },
-    Edit   { user: String, content: String, cursor: usize },
-    Cursor { user: String, position: usize },
-    Leave  { user: String },
+    Join {
+        user: String,
+        room: String,
+    },
+    Edit {
+        user: String,
+        content: String,
+        cursor: usize,
+    },
+    Cursor {
+        user: String,
+        position: usize,
+    },
+    Leave {
+        user: String,
+    },
 }
 
 // Moved here so both room.rs and ws_handler.rs can import it from one place
@@ -20,10 +32,20 @@ pub struct BroadcastPayload {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
     // Sent once when a client joins — loads the existing document
-    Snapshot { content: String },
+    Snapshot {
+        content: String,
+    },
     // Broadcast to all others when someone edits
-    Edit     { user: String, content: String, cursor: usize },
+    Edit {
+        user: String,
+        content: String,
+        cursor: usize,
+    },
     // Broadcast when someone joins/leaves (for user list)
-    Joined   { user: String },
-    Left     { user: String },
+    Joined {
+        user: String,
+    },
+    Left {
+        user: String,
+    },
 }
