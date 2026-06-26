@@ -2,7 +2,6 @@
 mod messages;
 mod room;
 mod ws_handler;
-
 use axum::{Router, routing::get};
 use room::RoomMap;
 use std::collections::HashMap;

@@ -5,27 +5,55 @@ import UserList from "@/components/userlist";
 import { useCollabSocket } from "@/components/useCollabSocket";
 
 export default function Page() {
-  const [code, setCode] = useState("fn main() {\n    println!(\"Hello!\");\n}");
-  const [users, setUsers] = useState<string[]>(["alice"]);
-  
-  // Use a ref to keep track of what the editor *thinks* the content currently is
+  const [code, setCode] = useState('fn main() {\n    println!("Hello!");\n}');
+  const [users, setUsers] = useState<string[]>([]);
+  const [username, setUsername] = useState("");
+  const [joined, setJoined] = useState(false);
+
   const isIncomingUpdate = useRef(false);
 
   const { sendEdit } = useCollabSocket({
-    user: "alice",
+    user: username,
     room: "room1",
     onSnapshot: (content) => {
       isIncomingUpdate.current = true;
       setCode(content);
     },
     onEdit: (content) => {
-      // Flag that this state change comes from the network, NOT user typing
       isIncomingUpdate.current = true;
       setCode(content);
     },
-    onUserJoin:  (u) => setUsers((prev) => [...new Set([...prev, u])]),
+    onUserJoin: (u) => setUsers((prev) => [...new Set([...prev, u])]),
     onUserLeave: (u) => setUsers((prev) => prev.filter((x) => x !== u)),
   });
+
+  const handleJoin = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (username.trim()) setJoined(true);
+  };
+
+  if (!joined) {
+    return (
+      <main className="h-screen flex items-center justify-center bg-zinc-950">
+        <form onSubmit={handleJoin} className="flex flex-col gap-2">
+          <input
+            type="text"
+            placeholder="Name"
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+            required
+            className="px-3 py-2 rounded bg-zinc-800 text-white"
+          />
+          <button
+            type="submit"
+            className="px-3 py-2 rounded bg-blue-600 text-white"
+          >
+            Join
+          </button>
+        </form>
+      </main>
+    );
+  }
 
   return (
     <main className="h-screen flex flex-col bg-zinc-950">
@@ -33,15 +61,12 @@ export default function Page() {
       <Editor
         value={code}
         onChange={(val) => {
-          // If this onChange was triggered by an incoming network edit, 
-          // just lower the flag and DO NOT send it back over the WebSocket.
           if (isIncomingUpdate.current) {
             isIncomingUpdate.current = false;
             return;
           }
-
           setCode(val);
-          sendEdit(val); // Only broadcasts when the user physically types!
+          sendEdit(val);
         }}
       />
     </main>
